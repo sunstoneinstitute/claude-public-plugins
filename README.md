@@ -90,6 +90,12 @@ Two things that are easy to forget:
 
 ---
 
+## License
+
+[MIT](LICENSE) © Sunstone Institute.
+
+---
+
 ## References
 
 - [Official Claude Code Plugin Marketplace Documentation](https://code.claude.com/docs/en/plugin-marketplaces)
