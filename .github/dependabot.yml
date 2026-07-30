@@ -1,0 +1,21 @@
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    open-pull-requests-limit: 5
+    groups:
+      github-actions-updates:
+        applies-to: version-updates
+        dependency-type: production
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "07:00"
+
+  - package-ecosystem: "uv"
+    directory: "/"
+    open-pull-requests-limit: 5
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"

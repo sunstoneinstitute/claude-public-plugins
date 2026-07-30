@@ -1,0 +1,15 @@
+repos:
+  - repo: local
+    hooks:
+      - id: check-plugin-structure
+        name: Check plugin directory structure
+        entry: scripts/check-plugin-structure.sh
+        language: script
+        pass_filenames: false
+        files: ^plugins/
+      - id: claude-plugin-validate
+        name: Validate Claude Plugin Marketplace
+        entry: claude plugin validate .
+        language: system
+        pass_filenames: false
+        files: ^(\.claude-plugin/marketplace\.json|plugins/)

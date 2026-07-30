@@ -1,0 +1,198 @@
+name: Auto Merge
+
+on:
+  pull_request_review:
+    types: [submitted]
+
+concurrency:
+  group: auto-merge-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  rebase-bump-merge:
+    if: |
+      contains(github.event.pull_request.labels.*.name, 'auto-merge') &&
+      github.event.review.state == 'approved'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+
+    steps:
+      - name: Verify all reviews approved
+        id: check-reviews
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          DECISION=$(gh pr view ${{ github.event.pull_request.number }} \
+            --repo ${{ github.repository }} \
+            --json reviewDecision -q '.reviewDecision')
+          if [ "$DECISION" != "APPROVED" ]; then
+            echo "PR not fully approved (decision: $DECISION). Skipping."
+            exit 1
+          fi
+
+      - name: Checkout PR branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+          fetch-depth: 0
+          token: ${{ github.token }}
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Install pre-commit and Claude CLI
+        run: |
+          pip install pre-commit
+          pre-commit install
+          npm install -g @anthropic-ai/claude-code
+
+      - name: Rebase, bump, and merge
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: |
+          PR_NUMBER=${{ github.event.pull_request.number }}
+          MAX_ATTEMPTS=3
+
+          # Determine bump type from labels
+          BUMP_TYPE=$(gh pr view "$PR_NUMBER" --repo "${{ github.repository }}" \
+            --json labels -q '.labels[].name' | grep -o 'bump-\(major\|minor\|patch\)' | head -1)
+
+          if [ -z "$BUMP_TYPE" ]; then
+            echo "No bump label found (bump-major, bump-minor or bump-patch). Skipping."
+            gh pr comment "$PR_NUMBER" --repo "${{ github.repository }}" \
+              --body "Auto-merge skipped: no version bump label (bump-major, bump-minor or bump-patch) found."
+            exit 1
+          fi
+
+          # Determine which plugins were modified (before any rebasing)
+          CHANGED_PLUGINS=$(git diff --name-only origin/main...HEAD \
+            | grep '^plugins/' | cut -d/ -f2 | sort -u)
+
+          # Filter out brand-new plugins (not present on main yet): their incoming
+          # version in marketplace.json is the initial version and must be preserved.
+          EXISTING_PLUGINS=$(git show origin/main:.claude-plugin/marketplace.json \
+            | python3 -c 'import json,sys; print("\n".join(p["name"] for p in json.load(sys.stdin).get("plugins", [])))')
+
+          PLUGINS=""
+          for p in $CHANGED_PLUGINS; do
+            if echo "$EXISTING_PLUGINS" | grep -qx "$p"; then
+              PLUGINS="$PLUGINS $p"
+            else
+              echo "Skipping bump for new plugin: $p (accepting incoming version)"
+            fi
+          done
+          PLUGINS=$(echo "$PLUGINS" | xargs)
+
+          if [ -z "$PLUGINS" ]; then
+            echo "No existing plugins to bump (new plugins only, or no plugin changes)."
+          fi
+
+          # Helper: drop any existing version bump commit from the tip
+          drop_bump_commit() {
+            if git log -1 --format='%s' | grep -q '^Bump plugin version(s):'; then
+              echo "Dropping existing version bump commit..."
+              git reset --soft HEAD~1
+              # Discard the staged bump from both manifests (the bump commit now
+              # carries plugin.json mirrors too), so the re-bump after rebase
+              # starts from a clean base.
+              git checkout -- .claude-plugin/marketplace.json plugins/*/.claude-plugin/plugin.json
+            fi
+          }
+
+          # Helper: update branch to latest main via rebase, falling back to merge
+          sync_with_main() {
+            git fetch origin main
+
+            # Try rebase first
+            if git rebase origin/main; then
+              echo "Rebase onto main succeeded."
+              return 0
+            fi
+
+            echo "Rebase conflict detected. Attempting resolution with Claude..."
+            claude --model claude-opus-4-6 --print \
+              "Resolve all git merge conflicts in this repo. For marketplace.json conflicts, accept the version from main (theirs) since we bump versions after rebase. For reference docs, intelligently merge content from both sides. After resolving each file, run 'git add <file>'. When all conflicts are resolved, run 'git rebase --continue'." \
+              2>&1 || true
+
+            # Check if rebase completed
+            if [ ! -d .git/rebase-merge ] && [ ! -d .git/rebase-apply ]; then
+              echo "Rebase conflicts resolved by Claude."
+              return 0
+            fi
+
+            # Rebase failed - abort and try merge instead
+            echo "Rebase resolution failed. Aborting rebase, falling back to merge..."
+            git rebase --abort
+
+            if git merge origin/main -m "Merge main into branch"; then
+              echo "Merge of main succeeded."
+              return 0
+            fi
+
+            echo "Merge conflict detected. Attempting resolution with Claude..."
+            claude --model claude-opus-4-6 --print \
+              "Resolve all git merge conflicts in this repo. For marketplace.json conflicts, accept the version from main (theirs) since we bump versions after merge. For reference docs, intelligently merge content from both sides. After resolving each file, run 'git add <file>'. When all conflicts are resolved, run 'git commit --no-edit'." \
+              2>&1 || true
+
+            # Check if merge completed
+            if git diff --quiet --cached 2>/dev/null && [ ! -f .git/MERGE_HEAD ]; then
+              echo "Merge conflicts resolved by Claude."
+              return 0
+            fi
+
+            # Both strategies failed
+            echo "Both rebase and merge failed."
+            git merge --abort 2>/dev/null || true
+            return 1
+          }
+
+          for attempt in $(seq 1 $MAX_ATTEMPTS); do
+            echo "=== Attempt $attempt of $MAX_ATTEMPTS ==="
+
+            # Drop any version bump commit before syncing with main
+            drop_bump_commit
+
+            # Sync branch with latest main
+            if ! sync_with_main; then
+              gh pr comment "$PR_NUMBER" --repo "${{ github.repository }}" \
+                --body "Auto-merge failed: could not resolve conflicts automatically (tried rebase and merge). Manual intervention needed."
+              exit 1
+            fi
+
+            # Bump versions if plugins were modified
+            if [ -n "$PLUGINS" ]; then
+              python3 scripts/bump-plugin-version.py \
+                --bump-type "${BUMP_TYPE#bump-}" \
+                --plugins $PLUGINS
+
+              # Stage BOTH the catalog and the per-plugin manifests the bump
+              # script mirrors into — staging only marketplace.json drops the
+              # plugin.json writes and reintroduces version drift.
+              git add .claude-plugin/marketplace.json plugins/*/.claude-plugin/plugin.json
+              git commit -m "Bump plugin version(s): ${BUMP_TYPE#bump-}"
+            fi
+
+            # Force push the updated branch
+            git push --force-with-lease
+
+            # Attempt merge
+            if gh pr merge "$PR_NUMBER" --repo "${{ github.repository }}" \
+              --rebase --delete-branch; then
+              echo "PR merged successfully."
+              exit 0
+            fi
+
+            echo "Merge failed. Retrying in $((attempt * 10)) seconds..."
+            sleep $((attempt * 10))
+          done
+
+          echo "All $MAX_ATTEMPTS merge attempts failed."
+          gh pr comment "$PR_NUMBER" --repo "${{ github.repository }}" \
+            --body "Auto-merge failed after $MAX_ATTEMPTS attempts. Manual merge required."
+          exit 1

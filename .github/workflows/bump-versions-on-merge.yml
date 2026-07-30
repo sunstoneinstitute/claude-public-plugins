@@ -1,0 +1,199 @@
+name: Bump Plugin Versions on Merge
+
+# Runs after any PR is merged into main. Detects which plugins were touched,
+# reads the bump label from the PR, and pushes a "Bump plugin version(s):"
+# commit to main. This guarantees that version bumps happen on every merge
+# path — not only the approval-driven auto-merge.yml flow.
+#
+# If auto-merge.yml already bumped versions as part of its rebase-and-merge,
+# this workflow detects that (by inspecting PR commit headlines) and skips
+# the bump — but still runs the final tagging step, which creates a
+# <plugin>-<version> tag for every marketplace.json version that doesn't
+# have one yet (regardless of which path produced the version).
+
+on:
+  pull_request:
+    types: [closed]
+
+concurrency:
+  group: bump-versions-main
+  cancel-in-progress: false
+
+jobs:
+  bump:
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Determine bump type from PR labels
+        id: bump_type
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          BUMP_TYPE=$(gh pr view "$PR_NUMBER" --repo "${{ github.repository }}" \
+            --json labels -q '.labels[].name' | grep -o 'bump-\(major\|minor\|patch\)' | head -1 || true)
+          if [ -z "$BUMP_TYPE" ]; then
+            echo "::notice::No bump label (bump-major/minor/patch) on PR #$PR_NUMBER. Skipping post-merge bump."
+            gh pr comment "$PR_NUMBER" --repo "${{ github.repository }}" \
+              --body "Post-merge version bump skipped: no \`bump-major\`/\`bump-minor\`/\`bump-patch\` label on this PR." || true
+            echo "type=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "Detected bump type: ${BUMP_TYPE#bump-}"
+          echo "type=${BUMP_TYPE#bump-}" >> "$GITHUB_OUTPUT"
+
+      - name: Detect if PR already includes a version bump
+        id: already_bumped
+        if: steps.bump_type.outputs.type != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          if gh pr view "$PR_NUMBER" --repo "${{ github.repository }}" \
+            --json commits -q '.commits[].messageHeadline' \
+            | grep -q '^Bump plugin version(s):'; then
+            echo "::notice::PR #$PR_NUMBER commit history already includes a version bump commit. Skipping."
+            echo "already=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "already=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Determine which existing plugins to bump
+        id: plugins
+        if: steps.bump_type.outputs.type != '' && steps.already_bumped.outputs.already == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          # Files changed by the PR
+          CHANGED_PLUGINS=$(gh pr view "$PR_NUMBER" --repo "${{ github.repository }}" \
+            --json files -q '.files[].path' | grep '^plugins/' | cut -d/ -f2 | sort -u || true)
+
+          if [ -z "$CHANGED_PLUGINS" ]; then
+            echo "::notice::No files under plugins/ changed in PR #$PR_NUMBER. Nothing to bump."
+            echo "list=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Plugins present in marketplace.json at the PR's base SHA (pre-merge state).
+          # We need this to filter out brand-new plugins, whose incoming version is the
+          # initial release version and must not be bumped.
+          if ! EXISTING_PLUGINS=$(git show "$BASE_SHA":.claude-plugin/marketplace.json 2>/dev/null \
+            | python3 -c 'import json,sys; print("\n".join(p["name"] for p in json.load(sys.stdin).get("plugins", [])))'); then
+            echo "::warning::Could not read marketplace.json at base SHA $BASE_SHA. Treating all changed plugins as existing."
+            EXISTING_PLUGINS="$CHANGED_PLUGINS"
+          fi
+
+          PLUGINS=""
+          for p in $CHANGED_PLUGINS; do
+            if echo "$EXISTING_PLUGINS" | grep -qx "$p"; then
+              PLUGINS="$PLUGINS $p"
+            else
+              echo "Skipping bump for new plugin: $p (accepting initial version)"
+            fi
+          done
+          PLUGINS=$(echo "$PLUGINS" | xargs)
+
+          if [ -z "$PLUGINS" ]; then
+            echo "::notice::Only new plugins changed in PR #$PR_NUMBER. No existing plugins to bump."
+          else
+            echo "Plugins to bump: $PLUGINS"
+          fi
+
+          echo "list=$PLUGINS" >> "$GITHUB_OUTPUT"
+
+      - name: Bump versions and push to main
+        if: steps.bump_type.outputs.type != '' && steps.already_bumped.outputs.already == 'false' && steps.plugins.outputs.list != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          BUMP_TYPE: ${{ steps.bump_type.outputs.type }}
+          PLUGINS: ${{ steps.plugins.outputs.list }}
+        run: |
+          set -e
+
+          python3 scripts/bump-plugin-version.py \
+            --bump-type "$BUMP_TYPE" \
+            --plugins $PLUGINS
+
+          if git diff --quiet -- .claude-plugin/marketplace.json; then
+            echo "::notice::marketplace.json not modified by bump script. Nothing to commit."
+            exit 0
+          fi
+
+          # Stage BOTH the catalog and the per-plugin manifests the bump script
+          # mirrors into. Staging only marketplace.json silently drops the
+          # plugin.json writes, which is what caused the historical version drift
+          # (marketplace ahead of plugin.json, the value that wins at install).
+          git add .claude-plugin/marketplace.json plugins/*/.claude-plugin/plugin.json
+          git commit -m "Bump plugin version(s): $BUMP_TYPE (PR #$PR_NUMBER)"
+
+          # Push with retry — if another post-merge bump landed first, pull-rebase and retry.
+          for attempt in 1 2 3; do
+            if git push origin main; then
+              echo "Bump pushed to main on attempt $attempt."
+              exit 0
+            fi
+            echo "Push attempt $attempt failed. Pulling and retrying..."
+            git pull --rebase origin main || true
+            sleep $((attempt * 5))
+          done
+
+          gh pr comment "$PR_NUMBER" --repo "${{ github.repository }}" \
+            --body "Post-merge version bump failed to push to main after 3 attempts. Manual bump required." || true
+          exit 1
+
+      # Create a <plugin>-<version> tag for every marketplace.json version that
+      # doesn't have one yet. This step runs for every merged PR (no `if:`), so
+      # it covers all the ways a new version can land on main:
+      #   - the bump commit this job just pushed (HEAD after the step above)
+      #   - a bump auto-merge.yml already made inside the PR (already_bumped)
+      #   - a brand-new plugin whose initial version is merged as-is (no bump)
+      # Tagging is idempotent — existing tags are left untouched.
+      - name: Tag plugin versions
+        run: |
+          git fetch --tags --quiet
+
+          python3 - <<'SCRIPT'
+          import json
+          import subprocess
+
+          with open(".claude-plugin/marketplace.json") as f:
+              catalog = json.load(f)
+
+          existing_tags = set(subprocess.run(
+              ["git", "tag", "--list"],
+              capture_output=True, text=True, check=True
+          ).stdout.splitlines())
+
+          for plugin in catalog.get("plugins", []):
+              name = plugin["name"]
+              version = plugin.get("version", "")
+              if not version:
+                  continue
+              tag = f"{name}-{version}"
+              if tag in existing_tags:
+                  print(f"Tag already exists: {tag}")
+                  continue
+              print(f"Creating tag: {tag}")
+              subprocess.run(["git", "tag", tag], check=True)
+              subprocess.run(["git", "push", "origin", tag], check=True)
+          SCRIPT
